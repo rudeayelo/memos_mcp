@@ -3,12 +3,20 @@ Memos MCP Server
 
 An MCP server that provides tools for interacting with a Memos instance.
 Supports searching, creating, and updating memos.
+
+Runs as a Remote MCP Server with Streamable HTTP transport.
 """
 
 import os
+import secrets
 from typing import Optional
+
 import httpx
 from fastmcp import FastMCP
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse, PlainTextResponse
 
 # Initialize FastMCP server
 mcp = FastMCP("memos")
@@ -16,6 +24,7 @@ mcp = FastMCP("memos")
 # Get Memos configuration from environment variables
 MEMOS_BASE_URL = os.getenv("MEMOS_BASE_URL", "http://localhost:5230")
 MEMOS_API_TOKEN = os.getenv("MEMOS_API_TOKEN", "")
+MEMOS_MCP_API_KEY = os.getenv("MEMOS_MCP_API_KEY", "")
 
 
 def get_headers() -> dict:
@@ -26,6 +35,42 @@ def get_headers() -> dict:
     if MEMOS_API_TOKEN:
         headers["Authorization"] = f"Bearer {MEMOS_API_TOKEN}"
     return headers
+
+
+class APIKeyAuthMiddleware(BaseHTTPMiddleware):
+    """Authenticate incoming MCP client connections via API key."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Allow health check without auth
+        if request.url.path == "/health":
+            return await call_next(request)
+
+        # Require Bearer token for /mcp endpoint
+        if request.url.path.startswith("/mcp"):
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                return JSONResponse(
+                    {"error": "Missing Authorization header"},
+                    status_code=401,
+                )
+
+            provided_key = auth_header[7:]  # Remove "Bearer " prefix
+            if not MEMOS_MCP_API_KEY:
+                return JSONResponse(
+                    {"error": "MEMOS_MCP_API_KEY not configured"},
+                    status_code=500,
+                )
+
+            if not secrets.compare_digest(provided_key, MEMOS_MCP_API_KEY):
+                return JSONResponse({"error": "Invalid API key"}, status_code=403)
+
+        return await call_next(request)
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request: Request) -> PlainTextResponse:
+    """Health check endpoint for container orchestration."""
+    return PlainTextResponse("OK")
 
 
 @mcp.tool()
@@ -321,4 +366,21 @@ async def get_memo(memo_uid: str) -> str:
         return f"Unexpected error: {str(e)}"
 
 
+def create_app():
+    """Create ASGI app with authentication middleware."""
+    return mcp.streamable_http_app(
+        path="/mcp",
+        user_middleware=[Middleware(APIKeyAuthMiddleware)],
+    )
 
+
+# ASGI application for uvicorn
+app = create_app()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.getenv("MEMOS_MCP_HOST", "0.0.0.0")
+    port = int(os.getenv("MEMOS_MCP_PORT", "8716"))
+    uvicorn.run("server:app", host=host, port=port)
