@@ -1,12 +1,14 @@
 [project]
 name = "memos-mcp"
-version = "0.1.1"
-description = "MCP server for interacting with Memos API"
+version = "0.2.0"
+description = "Remote MCP server for Memos API (Streamable HTTP)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=0.2.0",
+    "fastmcp>=2.3.2",
     "httpx>=0.27.0",
+    "uvicorn>=0.30.0",
+    "starlette>=0.37.0",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +23,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-
-[project.scripts]
-memos-mcp = "server:mcp.run"

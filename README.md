@@ -1,6 +1,8 @@
 # Memos MCP Server
 
-An MCP (Model Context Protocol) server that provides tools for interacting with a [Memos](https://github.com/usememos/memos) instance. This server allows AI assistants to search, create, and update memos through the Memos API.
+A remote MCP (Model Context Protocol) server that provides tools for interacting with a [Memos](https://github.com/usememos/memos) instance. This server allows AI assistants to search, create, and update memos through the Memos API.
+
+Uses **Streamable HTTP transport** (MCP spec 2025-03-26) for remote deployment.
 
 ## Features
 
@@ -8,8 +10,35 @@ An MCP (Model Context Protocol) server that provides tools for interacting with 
 - **Create Memos**: Create new memos with markdown support
 - **Update Memos**: Update existing memos (content, visibility, pinned status)
 - **Get Memo**: Retrieve a specific memo by UID
+- **Remote Deployment**: Run as a Docker container accessible over HTTP
+- **API Key Authentication**: Secure access to the MCP server
 
-## Installation
+## Quick Start (Docker)
+
+1. Clone and configure:
+```bash
+git clone <repository-url>
+cd memos_mcp
+cp .env.example .env
+```
+
+2. Generate an API key and edit `.env`:
+```bash
+openssl rand -base64 32
+# Add the generated key to MEMOS_MCP_API_KEY in .env
+```
+
+3. Build and run:
+```bash
+docker compose up -d
+```
+
+4. Verify:
+```bash
+curl http://localhost:8716/health
+```
+
+## Installation (Development)
 
 1. Clone this repository:
 ```bash
@@ -31,50 +60,47 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Set the following environment variables:
+### Environment Variables
 
-- `MEMOS_BASE_URL`: The base URL of your Memos instance (default: `http://localhost:5230`)
-- `MEMOS_API_TOKEN`: Your Memos API authentication token (optional for public instances)
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MEMOS_BASE_URL` | URL of your Memos instance | `http://localhost:5230` |
+| `MEMOS_API_TOKEN` | API token for Memos authentication | (none) |
+| `MEMOS_MCP_API_KEY` | API key for incoming MCP client auth | (required) |
 
-### Getting an API Token
+### Getting a Memos API Token
 
 1. Log into your Memos instance
 2. Go to Settings → Access Tokens
 3. Create a new access token
-4. Copy the token and set it as the `MEMOS_API_TOKEN` environment variable
+4. Copy the token and set it as `MEMOS_API_TOKEN`
 
-Example:
+### Generating an MCP API Key
+
 ```bash
-export MEMOS_BASE_URL="https://memos.example.com"
-export MEMOS_API_TOKEN="your-token-here"
+openssl rand -base64 32
 ```
+
+Copy the output and set it as `MEMOS_MCP_API_KEY`.
 
 ## Usage
 
 ### Running the Server
 
-#### Using uvx (no installation required)
+#### Docker (recommended for production)
 ```bash
-# Run directly with uvx
-uvx --from . memos-mcp
+docker compose up -d
 ```
 
-#### Using uv after installation
+#### Direct with uvicorn (development)
 ```bash
-# After running 'uv sync'
-uv run memos-mcp
+uv sync
+uv run uvicorn server:app --host 0.0.0.0 --port 8716
 ```
 
-#### Using FastMCP directly
+#### Python directly
 ```bash
-fastmcp run server.py
-```
-
-#### Programmatic usage
-```python
-from server import mcp
-
-# The server is ready to use
+python server.py
 ```
 
 ### Available Tools
@@ -141,6 +167,8 @@ result = await get_memo(memo_uid="abc123")
 
 ## Integration with MCP Clients
 
+This server uses **Streamable HTTP transport**, allowing remote connections from any MCP-compatible client.
+
 ### Claude Desktop
 
 Add to your Claude Desktop configuration file:
@@ -148,52 +176,41 @@ Add to your Claude Desktop configuration file:
 **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
-#### Using uvx (recommended - no installation needed)
 ```json
 {
   "mcpServers": {
     "memos": {
-      "command": "uvx",
-      "args": ["--from", "/path/to/memos_mcp", "memos-mcp"],
-      "env": {
-        "MEMOS_BASE_URL": "http://localhost:5230",
-        "MEMOS_API_TOKEN": "your-token-here"
+      "transport": "streamable-http",
+      "url": "https://your-server.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer your-memos-mcp-api-key"
       }
     }
   }
 }
 ```
 
-#### Using uv (after installation)
-```json
-{
-  "mcpServers": {
-    "memos": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/memos_mcp", "memos-mcp"],
-      "env": {
-        "MEMOS_BASE_URL": "http://localhost:5230",
-        "MEMOS_API_TOKEN": "your-token-here"
-      }
-    }
-  }
-}
-```
+### Other MCP Clients
 
-#### Using Python directly
-```json
-{
-  "mcpServers": {
-    "memos": {
-      "command": "python",
-      "args": ["-m", "fastmcp", "run", "/path/to/memos_mcp/server.py"],
-      "env": {
-        "MEMOS_BASE_URL": "http://localhost:5230",
-        "MEMOS_API_TOKEN": "your-token-here"
-      }
-    }
-  }
-}
+Configure your client with:
+- **Transport**: `streamable-http`
+- **URL**: `http://your-server:8716/mcp`
+- **Header**: `Authorization: Bearer <MEMOS_MCP_API_KEY>`
+
+### Security Notes
+
+For internet-facing deployments:
+- Use a reverse proxy (nginx, Traefik, Caddy) with TLS
+- The `/health` endpoint is public (no auth required) for container orchestration
+- The `/mcp` endpoint requires Bearer token authentication
+
+## Architecture
+
+```
+┌─────────────────┐     HTTPS      ┌─────────────────┐     HTTP      ┌─────────────────┐
+│   MCP Client    │ ──────────────>│  Memos MCP      │ ────────────>│    Memos        │
+│  (AI Assistant) │  Bearer Token  │  Server (HTTP)  │   API Token  │    Instance     │
+└─────────────────┘                └─────────────────┘              └─────────────────┘
 ```
 
 ## API Reference
@@ -206,14 +223,6 @@ This server is built on the Memos API v1. The API follows Google's API Improveme
 - `POST /api/v1/memos` - Create a memo
 - `GET /api/v1/memos/{uid}` - Get a specific memo
 - `PATCH /api/v1/memos/{uid}` - Update a memo
-
-### Authentication
-
-The server supports Bearer token authentication. Include your access token in the `Authorization` header:
-
-```
-Authorization: Bearer your-token-here
-```
 
 ## Development
 

@@ -1,0 +1,18 @@
+services:
+  memos-mcp:
+    build: .
+    container_name: memos-mcp
+    restart: unless-stopped
+    ports:
+      - "8716:8716"
+    environment:
+      MEMOS_BASE_URL: ${MEMOS_BASE_URL}
+      MEMOS_API_TOKEN: ${MEMOS_API_TOKEN}
+      MEMOS_MCP_API_KEY: ${MEMOS_MCP_API_KEY}
+      MEMOS_MCP_PORT: "8716"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8716 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
