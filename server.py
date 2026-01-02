@@ -755,6 +755,7 @@ def create_app():
             Middleware(OAuthAuthMiddleware),
         ],
         stateless_http=True,  # Required for Claude.ai remote MCP connections
+        json_response=True,   # Use JSON responses instead of SSE (better proxy compatibility)
     )
 
 
