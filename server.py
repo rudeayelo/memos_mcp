@@ -87,6 +87,10 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
     )
 
     async def dispatch(self, request: Request, call_next):
+        # Allow OPTIONS requests through for CORS preflight (no auth required)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
         # Allow public endpoints without auth
         if any(request.url.path.startswith(p) for p in self.PUBLIC_PATHS):
             return await call_next(request)
@@ -125,7 +129,14 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
                     },
                 )
 
-        return await call_next(request)
+        response = await call_next(request)
+
+        # Add headers to disable proxy buffering for SSE/streaming (critical for nginx/Synology)
+        if request.url.path.startswith("/mcp"):
+            response.headers["X-Accel-Buffering"] = "no"
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+
+        return response
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -400,13 +411,19 @@ async def token_endpoint(request: Request) -> JSONResponse:
         # Delete used authorization code
         del authorization_codes[code]
 
-        return JSONResponse({
-            "access_token": access_token,
-            "token_type": "Bearer",
-            "expires_in": OAUTH_TOKEN_EXPIRY_SECONDS,
-            "refresh_token": refresh_token,
-            "scope": code_data["scope"],
-        })
+        return JSONResponse(
+            {
+                "access_token": access_token,
+                "token_type": "Bearer",
+                "expires_in": OAUTH_TOKEN_EXPIRY_SECONDS,
+                "refresh_token": refresh_token,
+                "scope": code_data["scope"],
+            },
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            },
+        )
 
     elif grant_type == "refresh_token":
         refresh_token = data.get("refresh_token", "")
@@ -427,12 +444,18 @@ async def token_endpoint(request: Request) -> JSONResponse:
             "scope": token_data["scope"],
         }
 
-        return JSONResponse({
-            "access_token": new_access_token,
-            "token_type": "Bearer",
-            "expires_in": OAUTH_TOKEN_EXPIRY_SECONDS,
-            "scope": token_data["scope"],
-        })
+        return JSONResponse(
+            {
+                "access_token": new_access_token,
+                "token_type": "Bearer",
+                "expires_in": OAUTH_TOKEN_EXPIRY_SECONDS,
+                "scope": token_data["scope"],
+            },
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+            },
+        )
 
     return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
