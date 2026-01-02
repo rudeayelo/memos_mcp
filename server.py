@@ -689,6 +689,7 @@ def create_app():
         path="/mcp",
         transport="streamable-http",
         middleware=[Middleware(OAuthAuthMiddleware)],
+        stateless_http=True,  # Required for Claude.ai remote MCP connections
     )
 
 
