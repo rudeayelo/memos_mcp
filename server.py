@@ -42,6 +42,9 @@ def get_issuer_url(request: Request) -> str:
         return OAUTH_ISSUER_URL
     # Auto-detect from request: use X-Forwarded headers if behind a proxy
     proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    # Always use HTTPS if behind a proxy (critical for Claude.ai compatibility)
+    if request.headers.get("x-forwarded-proto") or request.headers.get("x-forwarded-host"):
+        proto = "https"
     host = request.headers.get("x-forwarded-host") or request.headers.get("host", request.url.netloc)
     return f"{proto}://{host}"
 
@@ -136,32 +139,66 @@ async def health_check(request: Request) -> PlainTextResponse:
 # =============================================================================
 
 
+# CORS preflight handler for all OAuth endpoints
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["OPTIONS"])
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["OPTIONS"])
+@mcp.custom_route("/register", methods=["OPTIONS"])
+@mcp.custom_route("/authorize", methods=["OPTIONS"])
+@mcp.custom_route("/token", methods=["OPTIONS"])
+@mcp.custom_route("/mcp", methods=["OPTIONS"])
+async def cors_preflight(request: Request) -> JSONResponse:
+    """Handle CORS preflight requests for Claude.ai compatibility."""
+    return JSONResponse(
+        {},
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, Accept",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+
+
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_metadata(request: Request) -> JSONResponse:
     """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
     issuer_url = get_issuer_url(request)
-    return JSONResponse({
-        "issuer": issuer_url,
-        "authorization_endpoint": f"{issuer_url}/authorize",
-        "token_endpoint": f"{issuer_url}/token",
-        "registration_endpoint": f"{issuer_url}/register",
-        "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
-        "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
-        "scopes_supported": ["mcp:tools"],
-    })
+    return JSONResponse(
+        {
+            "issuer": issuer_url,
+            "authorization_endpoint": f"{issuer_url}/authorize",
+            "token_endpoint": f"{issuer_url}/token",
+            "registration_endpoint": f"{issuer_url}/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic", "none"],
+            "scopes_supported": ["mcp:tools"],
+        },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def protected_resource_metadata(request: Request) -> JSONResponse:
     """OAuth 2.0 Protected Resource Metadata (RFC 9728)."""
     issuer_url = get_issuer_url(request)
-    return JSONResponse({
-        "resource": f"{issuer_url}/mcp",
-        "authorization_servers": [issuer_url],
-        "scopes_supported": ["mcp:tools"],
-    })
+    return JSONResponse(
+        {
+            "resource": f"{issuer_url}/mcp",
+            "authorization_servers": [issuer_url],
+            "scopes_supported": ["mcp:tools"],
+            "bearer_methods_supported": ["header"],
+        },
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @mcp.custom_route("/register", methods=["POST"])
@@ -175,19 +212,34 @@ async def register_client(request: Request) -> JSONResponse:
     client_id = secrets.token_urlsafe(16)
     client_secret = secrets.token_urlsafe(32)
 
+    # Build client info - only include non-null values (Claude Web fails on nulls)
     client_info = {
         "client_id": client_id,
         "client_secret": client_secret,
-        "client_name": body.get("client_name", "Unknown Client"),
-        "redirect_uris": body.get("redirect_uris", []),
-        "grant_types": body.get("grant_types", ["authorization_code", "refresh_token"]),
-        "response_types": body.get("response_types", ["code"]),
-        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "client_secret_post"),
+        "client_id_issued_at": int(datetime.utcnow().timestamp()),
+        "grant_types": body.get("grant_types") or ["authorization_code", "refresh_token"],
+        "response_types": body.get("response_types") or ["code"],
+        "token_endpoint_auth_method": "client_secret_post",
     }
+
+    # Only add optional fields if they have values (avoid nulls)
+    if body.get("client_name"):
+        client_info["client_name"] = body["client_name"]
+    if body.get("redirect_uris"):
+        client_info["redirect_uris"] = body["redirect_uris"]
+    if body.get("scope"):
+        client_info["scope"] = body["scope"]
 
     registered_clients[client_id] = client_info
 
-    return JSONResponse(client_info, status_code=201)
+    return JSONResponse(
+        client_info,
+        status_code=201,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @mcp.custom_route("/authorize", methods=["GET"])
