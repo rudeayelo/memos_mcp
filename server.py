@@ -32,8 +32,18 @@ MEMOS_API_TOKEN = os.getenv("MEMOS_API_TOKEN", "")
 
 # OAuth 2.0 configuration
 OAUTH_PASSWORD = os.getenv("OAUTH_PASSWORD", "")
-OAUTH_ISSUER_URL = os.getenv("OAUTH_ISSUER_URL", "http://localhost:8716")
+OAUTH_ISSUER_URL = os.getenv("OAUTH_ISSUER_URL", "")  # If empty, auto-detect from request
 OAUTH_TOKEN_EXPIRY_SECONDS = int(os.getenv("OAUTH_TOKEN_EXPIRY_SECONDS", "3600"))
+
+
+def get_issuer_url(request: Request) -> str:
+    """Get the OAuth issuer URL, auto-detecting from request if not configured."""
+    if OAUTH_ISSUER_URL:
+        return OAUTH_ISSUER_URL
+    # Auto-detect from request: use X-Forwarded headers if behind a proxy
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host", request.url.netloc)
+    return f"{proto}://{host}"
 
 # In-memory OAuth storage (resets on server restart)
 registered_clients: dict = {}      # client_id -> client metadata
@@ -80,13 +90,14 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
 
         # Require Bearer token for /mcp endpoint
         if request.url.path.startswith("/mcp"):
+            issuer_url = get_issuer_url(request)
             auth_header = request.headers.get("Authorization", "")
             if not auth_header.startswith("Bearer "):
                 return JSONResponse(
                     {"error": "unauthorized", "error_description": "Missing Authorization header"},
                     status_code=401,
                     headers={
-                        "WWW-Authenticate": f'Bearer resource_metadata="{OAUTH_ISSUER_URL}/.well-known/oauth-protected-resource"'
+                        "WWW-Authenticate": f'Bearer resource_metadata="{issuer_url}/.well-known/oauth-protected-resource"'
                     },
                 )
 
@@ -98,7 +109,7 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
                     {"error": "invalid_token", "error_description": "Token not found"},
                     status_code=401,
                     headers={
-                        "WWW-Authenticate": f'Bearer error="invalid_token", resource_metadata="{OAUTH_ISSUER_URL}/.well-known/oauth-protected-resource"'
+                        "WWW-Authenticate": f'Bearer error="invalid_token", resource_metadata="{issuer_url}/.well-known/oauth-protected-resource"'
                     },
                 )
 
@@ -107,7 +118,7 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
                     {"error": "invalid_token", "error_description": "Token expired"},
                     status_code=401,
                     headers={
-                        "WWW-Authenticate": f'Bearer error="invalid_token", resource_metadata="{OAUTH_ISSUER_URL}/.well-known/oauth-protected-resource"'
+                        "WWW-Authenticate": f'Bearer error="invalid_token", resource_metadata="{issuer_url}/.well-known/oauth-protected-resource"'
                     },
                 )
 
@@ -128,11 +139,12 @@ async def health_check(request: Request) -> PlainTextResponse:
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
 async def oauth_metadata(request: Request) -> JSONResponse:
     """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
+    issuer_url = get_issuer_url(request)
     return JSONResponse({
-        "issuer": OAUTH_ISSUER_URL,
-        "authorization_endpoint": f"{OAUTH_ISSUER_URL}/authorize",
-        "token_endpoint": f"{OAUTH_ISSUER_URL}/token",
-        "registration_endpoint": f"{OAUTH_ISSUER_URL}/register",
+        "issuer": issuer_url,
+        "authorization_endpoint": f"{issuer_url}/authorize",
+        "token_endpoint": f"{issuer_url}/token",
+        "registration_endpoint": f"{issuer_url}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -144,9 +156,10 @@ async def oauth_metadata(request: Request) -> JSONResponse:
 @mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
 async def protected_resource_metadata(request: Request) -> JSONResponse:
     """OAuth 2.0 Protected Resource Metadata (RFC 9728)."""
+    issuer_url = get_issuer_url(request)
     return JSONResponse({
-        "resource": f"{OAUTH_ISSUER_URL}/mcp",
-        "authorization_servers": [OAUTH_ISSUER_URL],
+        "resource": f"{issuer_url}/mcp",
+        "authorization_servers": [issuer_url],
         "scopes_supported": ["mcp:tools"],
     })
 
