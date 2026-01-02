@@ -20,6 +20,7 @@ import httpx
 from fastmcp import FastMCP
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
@@ -148,27 +149,6 @@ async def health_check(request: Request) -> PlainTextResponse:
 # =============================================================================
 # OAuth 2.0 Endpoints
 # =============================================================================
-
-
-# CORS preflight handler for all OAuth endpoints
-@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["OPTIONS"])
-@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["OPTIONS"])
-@mcp.custom_route("/register", methods=["OPTIONS"])
-@mcp.custom_route("/authorize", methods=["OPTIONS"])
-@mcp.custom_route("/token", methods=["OPTIONS"])
-@mcp.custom_route("/mcp", methods=["OPTIONS"])
-async def cors_preflight(request: Request) -> JSONResponse:
-    """Handle CORS preflight requests for Claude.ai compatibility."""
-    return JSONResponse(
-        {},
-        status_code=204,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id, Accept",
-            "Access-Control-Max-Age": "86400",
-        },
-    )
 
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
@@ -759,11 +739,21 @@ async def get_memo(memo_uid: str) -> str:
 
 
 def create_app():
-    """Create ASGI app with OAuth authentication middleware."""
+    """Create ASGI app with OAuth authentication and CORS middleware."""
     return mcp.http_app(
         path="/mcp",
         transport="streamable-http",
-        middleware=[Middleware(OAuthAuthMiddleware)],
+        middleware=[
+            # CORS middleware MUST come first to handle preflight OPTIONS requests
+            Middleware(
+                CORSMiddleware,
+                allow_origins=["*"],
+                allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
+                allow_headers=["*"],
+                expose_headers=["Mcp-Session-Id"],
+            ),
+            Middleware(OAuthAuthMiddleware),
+        ],
         stateless_http=True,  # Required for Claude.ai remote MCP connections
     )
 
