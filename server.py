@@ -5,18 +5,23 @@ An MCP server that provides tools for interacting with a Memos instance.
 Supports searching, creating, and updating memos.
 
 Runs as a Remote MCP Server with Streamable HTTP transport.
+Uses OAuth 2.0 Authorization Code flow with PKCE for authentication.
 """
 
+import base64
+import hashlib
 import os
 import secrets
+from datetime import datetime, timedelta
 from typing import Optional
+from urllib.parse import urlencode
 
 import httpx
 from fastmcp import FastMCP
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 # Initialize FastMCP server
 mcp = FastMCP("memos")
@@ -24,7 +29,17 @@ mcp = FastMCP("memos")
 # Get Memos configuration from environment variables
 MEMOS_BASE_URL = os.getenv("MEMOS_BASE_URL", "http://localhost:5230")
 MEMOS_API_TOKEN = os.getenv("MEMOS_API_TOKEN", "")
-MEMOS_MCP_API_KEY = os.getenv("MEMOS_MCP_API_KEY", "")
+
+# OAuth 2.0 configuration
+OAUTH_PASSWORD = os.getenv("OAUTH_PASSWORD", "")
+OAUTH_ISSUER_URL = os.getenv("OAUTH_ISSUER_URL", "http://localhost:8716")
+OAUTH_TOKEN_EXPIRY_SECONDS = int(os.getenv("OAUTH_TOKEN_EXPIRY_SECONDS", "3600"))
+
+# In-memory OAuth storage (resets on server restart)
+registered_clients: dict = {}      # client_id -> client metadata
+authorization_codes: dict = {}     # code -> {client_id, redirect_uri, code_challenge, expires_at, scope}
+access_tokens: dict = {}           # token -> {client_id, expires_at, scope}
+refresh_tokens: dict = {}          # refresh_token -> {client_id, scope}
 
 
 def get_headers() -> dict:
@@ -37,12 +52,30 @@ def get_headers() -> dict:
     return headers
 
 
-class APIKeyAuthMiddleware(BaseHTTPMiddleware):
-    """Authenticate incoming MCP client connections via API key."""
+def verify_pkce(code_verifier: str, code_challenge: str) -> bool:
+    """Verify PKCE code_verifier matches code_challenge using S256 method."""
+    if not code_verifier or not code_challenge:
+        return False
+    # SHA256 hash of code_verifier, then base64url encode (no padding)
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return secrets.compare_digest(computed, code_challenge)
+
+
+class OAuthAuthMiddleware(BaseHTTPMiddleware):
+    """Authenticate incoming MCP client connections via OAuth 2.0 access tokens."""
+
+    PUBLIC_PATHS = (
+        "/health",
+        "/.well-known/",
+        "/authorize",
+        "/token",
+        "/register",
+    )
 
     async def dispatch(self, request: Request, call_next):
-        # Allow health check without auth
-        if request.url.path == "/health":
+        # Allow public endpoints without auth
+        if any(request.url.path.startswith(p) for p in self.PUBLIC_PATHS):
             return await call_next(request)
 
         # Require Bearer token for /mcp endpoint
@@ -50,19 +83,33 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
             auth_header = request.headers.get("Authorization", "")
             if not auth_header.startswith("Bearer "):
                 return JSONResponse(
-                    {"error": "Missing Authorization header"},
+                    {"error": "unauthorized", "error_description": "Missing Authorization header"},
                     status_code=401,
+                    headers={
+                        "WWW-Authenticate": f'Bearer resource_metadata="{OAUTH_ISSUER_URL}/.well-known/oauth-protected-resource"'
+                    },
                 )
 
-            provided_key = auth_header[7:]  # Remove "Bearer " prefix
-            if not MEMOS_MCP_API_KEY:
+            token = auth_header[7:]  # Remove "Bearer " prefix
+            token_data = access_tokens.get(token)
+
+            if not token_data:
                 return JSONResponse(
-                    {"error": "MEMOS_MCP_API_KEY not configured"},
-                    status_code=500,
+                    {"error": "invalid_token", "error_description": "Token not found"},
+                    status_code=401,
+                    headers={
+                        "WWW-Authenticate": f'Bearer error="invalid_token", resource_metadata="{OAUTH_ISSUER_URL}/.well-known/oauth-protected-resource"'
+                    },
                 )
 
-            if not secrets.compare_digest(provided_key, MEMOS_MCP_API_KEY):
-                return JSONResponse({"error": "Invalid API key"}, status_code=403)
+            if token_data["expires_at"] < datetime.utcnow():
+                return JSONResponse(
+                    {"error": "invalid_token", "error_description": "Token expired"},
+                    status_code=401,
+                    headers={
+                        "WWW-Authenticate": f'Bearer error="invalid_token", resource_metadata="{OAUTH_ISSUER_URL}/.well-known/oauth-protected-resource"'
+                    },
+                )
 
         return await call_next(request)
 
@@ -71,6 +118,253 @@ class APIKeyAuthMiddleware(BaseHTTPMiddleware):
 async def health_check(request: Request) -> PlainTextResponse:
     """Health check endpoint for container orchestration."""
     return PlainTextResponse("OK")
+
+
+# =============================================================================
+# OAuth 2.0 Endpoints
+# =============================================================================
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+async def oauth_metadata(request: Request) -> JSONResponse:
+    """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
+    return JSONResponse({
+        "issuer": OAUTH_ISSUER_URL,
+        "authorization_endpoint": f"{OAUTH_ISSUER_URL}/authorize",
+        "token_endpoint": f"{OAUTH_ISSUER_URL}/token",
+        "registration_endpoint": f"{OAUTH_ISSUER_URL}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "scopes_supported": ["mcp:tools"],
+    })
+
+
+@mcp.custom_route("/.well-known/oauth-protected-resource", methods=["GET"])
+async def protected_resource_metadata(request: Request) -> JSONResponse:
+    """OAuth 2.0 Protected Resource Metadata (RFC 9728)."""
+    return JSONResponse({
+        "resource": f"{OAUTH_ISSUER_URL}/mcp",
+        "authorization_servers": [OAUTH_ISSUER_URL],
+        "scopes_supported": ["mcp:tools"],
+    })
+
+
+@mcp.custom_route("/register", methods=["POST"])
+async def register_client(request: Request) -> JSONResponse:
+    """OAuth 2.0 Dynamic Client Registration (RFC 7591)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    client_id = secrets.token_urlsafe(16)
+    client_secret = secrets.token_urlsafe(32)
+
+    client_info = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "client_name": body.get("client_name", "Unknown Client"),
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": body.get("grant_types", ["authorization_code", "refresh_token"]),
+        "response_types": body.get("response_types", ["code"]),
+        "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "client_secret_post"),
+    }
+
+    registered_clients[client_id] = client_info
+
+    return JSONResponse(client_info, status_code=201)
+
+
+@mcp.custom_route("/authorize", methods=["GET"])
+async def authorize_get(request: Request) -> HTMLResponse:
+    """Display OAuth authorization login form."""
+    client_id = request.query_params.get("client_id", "")
+    redirect_uri = request.query_params.get("redirect_uri", "")
+    state = request.query_params.get("state", "")
+    code_challenge = request.query_params.get("code_challenge", "")
+    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
+    scope = request.query_params.get("scope", "mcp:tools")
+
+    # Validate client_id
+    if client_id not in registered_clients:
+        return HTMLResponse(
+            "<h1>Error</h1><p>Unknown client_id. Please register first.</p>",
+            status_code=400,
+        )
+
+    # Simple HTML login form
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Authorize - Memos MCP</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               max-width: 400px; margin: 100px auto; padding: 20px; }}
+        h1 {{ color: #333; }}
+        form {{ background: #f5f5f5; padding: 20px; border-radius: 8px; }}
+        label {{ display: block; margin-bottom: 5px; font-weight: 500; }}
+        input[type="password"] {{ width: 100%; padding: 10px; margin-bottom: 15px;
+                                  border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }}
+        button {{ background: #007bff; color: white; padding: 10px 20px; border: none;
+                  border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; }}
+        button:hover {{ background: #0056b3; }}
+        .info {{ color: #666; font-size: 14px; margin-bottom: 20px; }}
+    </style>
+</head>
+<body>
+    <h1>Memos MCP</h1>
+    <p class="info">An application is requesting access to your Memos.</p>
+    <form method="POST" action="/authorize">
+        <input type="hidden" name="client_id" value="{client_id}">
+        <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+        <input type="hidden" name="state" value="{state}">
+        <input type="hidden" name="code_challenge" value="{code_challenge}">
+        <input type="hidden" name="code_challenge_method" value="{code_challenge_method}">
+        <input type="hidden" name="scope" value="{scope}">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required autofocus>
+        <button type="submit">Authorize</button>
+    </form>
+</body>
+</html>"""
+    return HTMLResponse(html)
+
+
+@mcp.custom_route("/authorize", methods=["POST"])
+async def authorize_post(request: Request) -> RedirectResponse:
+    """Validate password and issue authorization code."""
+    form = await request.form()
+
+    client_id = form.get("client_id", "")
+    redirect_uri = form.get("redirect_uri", "")
+    state = form.get("state", "")
+    code_challenge = form.get("code_challenge", "")
+    code_challenge_method = form.get("code_challenge_method", "S256")
+    scope = form.get("scope", "mcp:tools")
+    password = form.get("password", "")
+
+    # Validate password
+    if not OAUTH_PASSWORD:
+        return HTMLResponse(
+            "<h1>Error</h1><p>OAUTH_PASSWORD not configured on server.</p>",
+            status_code=500,
+        )
+
+    if not secrets.compare_digest(password, OAUTH_PASSWORD):
+        return HTMLResponse(
+            "<h1>Error</h1><p>Invalid password. Please try again.</p>",
+            status_code=401,
+        )
+
+    # Generate authorization code
+    auth_code = secrets.token_urlsafe(32)
+    authorization_codes[auth_code] = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "scope": scope,
+        "expires_at": datetime.utcnow() + timedelta(minutes=5),
+    }
+
+    # Redirect back to client with authorization code
+    params = {"code": auth_code}
+    if state:
+        params["state"] = state
+
+    redirect_url = f"{redirect_uri}?{urlencode(params)}"
+    return RedirectResponse(redirect_url, status_code=302)
+
+
+@mcp.custom_route("/token", methods=["POST"])
+async def token_endpoint(request: Request) -> JSONResponse:
+    """Exchange authorization code or refresh token for access token."""
+    form = await request.form()
+    grant_type = form.get("grant_type", "")
+
+    if grant_type == "authorization_code":
+        code = form.get("code", "")
+        code_verifier = form.get("code_verifier", "")
+        client_id = form.get("client_id", "")
+
+        # Validate authorization code
+        code_data = authorization_codes.get(code)
+        if not code_data:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Invalid authorization code"}, status_code=400)
+
+        if code_data["expires_at"] < datetime.utcnow():
+            del authorization_codes[code]
+            return JSONResponse({"error": "invalid_grant", "error_description": "Authorization code expired"}, status_code=400)
+
+        if code_data["client_id"] != client_id:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Client ID mismatch"}, status_code=400)
+
+        # Validate PKCE
+        if code_data.get("code_challenge"):
+            if not verify_pkce(code_verifier, code_data["code_challenge"]):
+                return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+
+        # Generate tokens
+        access_token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
+
+        access_tokens[access_token] = {
+            "client_id": client_id,
+            "expires_at": datetime.utcnow() + timedelta(seconds=OAUTH_TOKEN_EXPIRY_SECONDS),
+            "scope": code_data["scope"],
+        }
+        refresh_tokens[refresh_token] = {
+            "client_id": client_id,
+            "scope": code_data["scope"],
+        }
+
+        # Delete used authorization code
+        del authorization_codes[code]
+
+        return JSONResponse({
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": OAUTH_TOKEN_EXPIRY_SECONDS,
+            "refresh_token": refresh_token,
+            "scope": code_data["scope"],
+        })
+
+    elif grant_type == "refresh_token":
+        refresh_token = form.get("refresh_token", "")
+        client_id = form.get("client_id", "")
+
+        token_data = refresh_tokens.get(refresh_token)
+        if not token_data:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Invalid refresh token"}, status_code=400)
+
+        if token_data["client_id"] != client_id:
+            return JSONResponse({"error": "invalid_grant", "error_description": "Client ID mismatch"}, status_code=400)
+
+        # Generate new access token
+        new_access_token = secrets.token_urlsafe(32)
+        access_tokens[new_access_token] = {
+            "client_id": client_id,
+            "expires_at": datetime.utcnow() + timedelta(seconds=OAUTH_TOKEN_EXPIRY_SECONDS),
+            "scope": token_data["scope"],
+        }
+
+        return JSONResponse({
+            "access_token": new_access_token,
+            "token_type": "Bearer",
+            "expires_in": OAUTH_TOKEN_EXPIRY_SECONDS,
+            "scope": token_data["scope"],
+        })
+
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+
+# =============================================================================
+# Memos Tools
+# =============================================================================
 
 
 @mcp.tool()
@@ -367,10 +661,11 @@ async def get_memo(memo_uid: str) -> str:
 
 
 def create_app():
-    """Create ASGI app with authentication middleware."""
-    return mcp.streamable_http_app(
+    """Create ASGI app with OAuth authentication middleware."""
+    return mcp.http_app(
         path="/mcp",
-        user_middleware=[Middleware(APIKeyAuthMiddleware)],
+        transport="streamable-http",
+        middleware=[Middleware(OAuthAuthMiddleware)],
     )
 
 
