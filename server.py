@@ -296,13 +296,23 @@ async def authorize_post(request: Request) -> RedirectResponse:
 @mcp.custom_route("/token", methods=["POST"])
 async def token_endpoint(request: Request) -> JSONResponse:
     """Exchange authorization code or refresh token for access token."""
-    form = await request.form()
-    grant_type = form.get("grant_type", "")
+    # Handle both JSON and form-urlencoded content types
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+    else:
+        form = await request.form()
+        data = {k: v for k, v in form.items()}
+
+    grant_type = data.get("grant_type", "")
 
     if grant_type == "authorization_code":
-        code = form.get("code", "")
-        code_verifier = form.get("code_verifier", "")
-        client_id = form.get("client_id", "")
+        code = data.get("code", "")
+        code_verifier = data.get("code_verifier", "")
+        client_id = data.get("client_id", "")
 
         # Validate authorization code
         code_data = authorization_codes.get(code)
@@ -347,8 +357,8 @@ async def token_endpoint(request: Request) -> JSONResponse:
         })
 
     elif grant_type == "refresh_token":
-        refresh_token = form.get("refresh_token", "")
-        client_id = form.get("client_id", "")
+        refresh_token = data.get("refresh_token", "")
+        client_id = data.get("client_id", "")
 
         token_data = refresh_tokens.get(refresh_token)
         if not token_data:
@@ -391,7 +401,7 @@ async def search_memos(
 ) -> str:
     """
     Search for memos with optional filters.
-    
+
     Args:
         query: Text to search for in memo content
         creator_id: Filter by creator user ID
@@ -399,39 +409,39 @@ async def search_memos(
         visibility: Filter by visibility (PUBLIC, PROTECTED, PRIVATE)
         limit: Maximum number of results to return (default: 10)
         offset: Number of results to skip (default: 0)
-    
+
     Returns:
         JSON string containing the list of matching memos
     """
     # Build filter expression
     filters = []
-    
+
     if creator_id is not None:
         filters.append(f"creator_id == {creator_id}")
-    
+
     if query:
         # Escape quotes in query
         escaped_query = query.replace('"', '\\"')
         filters.append(f'content.contains("{escaped_query}")')
-    
+
     if tag:
         escaped_tag = tag.replace('"', '\\"')
         filters.append(f'tag in ["{escaped_tag}"]')
-    
+
     if visibility:
         filters.append(f'visibility == "{visibility.upper()}"')
-    
+
     # Combine filters with AND operator
     filter_str = " && ".join(filters) if filters else ""
-    
+
     # Build request parameters
     params = {
         "pageSize": limit,
     }
-    
+
     if filter_str:
         params["filter"] = filter_str
-    
+
     # Calculate page token for pagination
     if offset > 0:
         # For simplicity, we'll use offset/limit approach
@@ -439,7 +449,7 @@ async def search_memos(
         page = offset // limit
         if page > 0:
             params["pageToken"] = f"offset={offset}"
-    
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -450,7 +460,7 @@ async def search_memos(
             )
             response.raise_for_status()
             data = response.json()
-            
+
             # Format the response nicely
             memos = data.get("memos", [])
             result = {
@@ -471,9 +481,9 @@ async def search_memos(
                 ],
                 "nextPageToken": data.get("nextPageToken", "")
             }
-            
+
             return str(result)
-            
+
     except httpx.HTTPError as e:
         return f"Error searching memos: {str(e)}"
     except Exception as e:
@@ -487,11 +497,11 @@ async def create_memo(
 ) -> str:
     """
     Create a new memo.
-    
+
     Args:
         content: The content of the memo (supports Markdown)
         visibility: Visibility level - PUBLIC, PROTECTED, or PRIVATE (default: PRIVATE)
-    
+
     Returns:
         JSON string containing the created memo details
     """
@@ -500,13 +510,13 @@ async def create_memo(
     visibility = visibility.upper()
     if visibility not in valid_visibilities:
         return f"Error: visibility must be one of {', '.join(valid_visibilities)}"
-    
+
     # Build request payload
     payload = {
         "content": content,
         "visibility": visibility
     }
-    
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -517,7 +527,7 @@ async def create_memo(
             )
             response.raise_for_status()
             memo = response.json()
-            
+
             # Format the response
             result = {
                 "success": True,
@@ -533,9 +543,9 @@ async def create_memo(
                     "displayTime": memo.get("displayTime"),
                 }
             }
-            
+
             return str(result)
-            
+
     except httpx.HTTPError as e:
         return f"Error creating memo: {str(e)}"
     except Exception as e:
@@ -551,13 +561,13 @@ async def update_memo(
 ) -> str:
     """
     Update an existing memo.
-    
+
     Args:
         memo_uid: The UID of the memo to update (e.g., "abc123")
         content: New content for the memo (optional)
         visibility: New visibility level - PUBLIC, PROTECTED, or PRIVATE (optional)
         pinned: Whether to pin the memo (optional)
-    
+
     Returns:
         JSON string containing the updated memo details
     """
@@ -567,26 +577,26 @@ async def update_memo(
         visibility = visibility.upper()
         if visibility not in valid_visibilities:
             return f"Error: visibility must be one of {', '.join(valid_visibilities)}"
-    
+
     # Build update payload and update mask
     memo_data = {"state": "STATE_UNSPECIFIED"}
     update_paths = []
-    
+
     if content is not None:
         memo_data["content"] = content
         update_paths.append("content")
-    
+
     if visibility is not None:
         memo_data["visibility"] = visibility
         update_paths.append("visibility")
-    
+
     if pinned is not None:
         memo_data["pinned"] = pinned
         update_paths.append("pinned")
-    
+
     if not update_paths:
         return "Error: At least one field (content, visibility, or pinned) must be provided for update"
-    
+
     # Build the full payload
     memo_name = f"memos/{memo_uid}"
     payload = {
@@ -603,7 +613,7 @@ async def update_memo(
             )
             response.raise_for_status()
             memo = response.json()
-            
+
             # Format the response
             result = {
                 "success": True,
@@ -619,9 +629,9 @@ async def update_memo(
                     "displayTime": memo.get("displayTime"),
                 }
             }
-            
+
             return str(result)
-            
+
     except httpx.HTTPError as e:
         return f"Error updating memo: {str(e)}"
     except Exception as e:
@@ -632,15 +642,15 @@ async def update_memo(
 async def get_memo(memo_uid: str) -> str:
     """
     Get a specific memo by its UID.
-    
+
     Args:
         memo_uid: The UID of the memo to retrieve (e.g., "abc123")
-    
+
     Returns:
         JSON string containing the memo details
     """
     memo_name = f"memos/{memo_uid}"
-    
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
@@ -650,7 +660,7 @@ async def get_memo(memo_uid: str) -> str:
             )
             response.raise_for_status()
             memo = response.json()
-            
+
             # Format the response
             result = {
                 "name": memo.get("name"),
@@ -664,9 +674,9 @@ async def get_memo(memo_uid: str) -> str:
                 "displayTime": memo.get("displayTime"),
                 "snippet": memo.get("snippet", ""),
             }
-            
+
             return str(result)
-            
+
     except httpx.HTTPError as e:
         return f"Error getting memo: {str(e)}"
     except Exception as e:
