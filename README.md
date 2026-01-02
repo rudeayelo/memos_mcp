@@ -2,7 +2,7 @@
 
 A remote MCP (Model Context Protocol) server that provides tools for interacting with a [Memos](https://github.com/usememos/memos) instance. This server allows AI assistants to search, create, and update memos through the Memos API.
 
-Uses **Streamable HTTP transport** (MCP spec 2025-03-26) for remote deployment.
+Uses **Streamable HTTP transport** (MCP spec 2025-03-26) for remote deployment with **OAuth 2.0** authentication.
 
 ## Features
 
@@ -11,7 +11,7 @@ Uses **Streamable HTTP transport** (MCP spec 2025-03-26) for remote deployment.
 - **Update Memos**: Update existing memos (content, visibility, pinned status)
 - **Get Memo**: Retrieve a specific memo by UID
 - **Remote Deployment**: Run as a Docker container accessible over HTTP
-- **API Key Authentication**: Secure access to the MCP server
+- **OAuth 2.0 Authentication**: Works with Claude Desktop, Claude.ai, and mobile apps
 
 ## Quick Start (Docker)
 
@@ -22,10 +22,15 @@ cd memos_mcp
 cp .env.example .env
 ```
 
-2. Generate an API key and edit `.env`:
+2. Edit `.env` with your settings:
 ```bash
-openssl rand -base64 32
-# Add the generated key to MEMOS_MCP_API_KEY in .env
+# Required: Set your Memos instance URL and token
+MEMOS_BASE_URL=http://your-memos-instance:5230
+MEMOS_API_TOKEN=your-memos-token
+
+# Required: OAuth settings
+OAUTH_PASSWORD=your-secure-password
+OAUTH_ISSUER_URL=https://your-public-server-url.com
 ```
 
 3. Build and run:
@@ -66,7 +71,9 @@ pip install -r requirements.txt
 |----------|-------------|---------|
 | `MEMOS_BASE_URL` | URL of your Memos instance | `http://localhost:5230` |
 | `MEMOS_API_TOKEN` | API token for Memos authentication | (none) |
-| `MEMOS_MCP_API_KEY` | API key for incoming MCP client auth | (required) |
+| `OAUTH_PASSWORD` | Password for OAuth authorization | (required) |
+| `OAUTH_ISSUER_URL` | Public HTTPS URL of this server | `http://localhost:8716` |
+| `OAUTH_TOKEN_EXPIRY_SECONDS` | Access token lifetime | `3600` |
 
 ### Getting a Memos API Token
 
@@ -74,14 +81,6 @@ pip install -r requirements.txt
 2. Go to Settings → Access Tokens
 3. Create a new access token
 4. Copy the token and set it as `MEMOS_API_TOKEN`
-
-### Generating an MCP API Key
-
-```bash
-openssl rand -base64 32
-```
-
-Copy the output and set it as `MEMOS_MCP_API_KEY`.
 
 ## Usage
 
@@ -165,52 +164,63 @@ Get a specific memo by its UID.
 result = await get_memo(memo_uid="abc123")
 ```
 
-## Integration with MCP Clients
+## Integration with Claude
 
-This server uses **Streamable HTTP transport**, allowing remote connections from any MCP-compatible client.
+This server uses **OAuth 2.0** authentication, making it compatible with Claude as a Remote MCP connector.
 
-### Claude Desktop
+### Adding as a Claude Connector
 
-Add to your Claude Desktop configuration file:
+1. Go to Claude Settings → Connectors → Add Connector
+2. Enter your server URL: `https://your-server.example.com`
+3. Claude will discover the OAuth endpoints automatically
+4. You'll be redirected to a login page - enter your `OAUTH_PASSWORD`
+5. Once authorized, Claude can access your Memos
 
-**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
-**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+### How OAuth Works
 
-```json
-{
-  "mcpServers": {
-    "memos": {
-      "transport": "streamable-http",
-      "url": "https://your-server.example.com/mcp",
-      "headers": {
-        "Authorization": "Bearer your-memos-mcp-api-key"
-      }
-    }
-  }
-}
-```
+When you connect Claude to this server:
 
-### Other MCP Clients
+1. Claude discovers OAuth settings via `/.well-known/oauth-authorization-server`
+2. Claude registers itself as an OAuth client via `/register`
+3. You're shown a login page at `/authorize` - enter your password
+4. Claude receives an access token and uses it for MCP requests
+5. Tokens expire after `OAUTH_TOKEN_EXPIRY_SECONDS` (default: 1 hour)
+6. Claude automatically refreshes tokens when needed
 
-Configure your client with:
-- **Transport**: `streamable-http`
-- **URL**: `http://your-server:8716/mcp`
-- **Header**: `Authorization: Bearer <MEMOS_MCP_API_KEY>`
+### OAuth Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `/.well-known/oauth-authorization-server` | OAuth metadata discovery |
+| `/.well-known/oauth-protected-resource` | Protected resource metadata |
+| `/register` | Dynamic client registration |
+| `/authorize` | Authorization (login) page |
+| `/token` | Token exchange endpoint |
 
 ### Security Notes
 
-For internet-facing deployments:
-- Use a reverse proxy (nginx, Traefik, Caddy) with TLS
-- The `/health` endpoint is public (no auth required) for container orchestration
-- The `/mcp` endpoint requires Bearer token authentication
+- **HTTPS Required**: OAuth tokens must be transmitted over HTTPS
+- **In-Memory Tokens**: Tokens are stored in memory and lost on server restart (you'll need to re-authorize)
+- **Single User**: This implementation uses a single password for all access
+- **PKCE**: Full PKCE support for secure token exchange
 
 ## Architecture
 
 ```
 ┌─────────────────┐     HTTPS      ┌─────────────────┐     HTTP      ┌─────────────────┐
-│   MCP Client    │ ──────────────>│  Memos MCP      │ ────────────>│    Memos        │
-│  (AI Assistant) │  Bearer Token  │  Server (HTTP)  │   API Token  │    Instance     │
+│   Claude        │ ──────────────>│  Memos MCP      │ ────────────>│    Memos        │
+│ (Desktop/Web)   │  OAuth 2.0     │  Server         │   API Token  │    Instance     │
 └─────────────────┘                └─────────────────┘              └─────────────────┘
+```
+
+**OAuth Flow:**
+```
+1. Claude ──> GET /.well-known/oauth-authorization-server (discover endpoints)
+2. Claude ──> POST /register (register as client)
+3. Claude ──> GET /authorize?... (redirect user to login)
+4. User enters password, POST /authorize
+5. Claude ──> POST /token (exchange code for access token)
+6. Claude ──> POST /mcp (use access token for MCP requests)
 ```
 
 ## API Reference
@@ -234,7 +244,7 @@ pytest
 
 ### Code Structure
 
-- `server.py`: Main MCP server implementation with all tools
+- `server.py`: Main MCP server implementation with OAuth and tools
 - `requirements.txt`: Python dependencies
 
 ## About Memos
