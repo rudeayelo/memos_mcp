@@ -96,8 +96,8 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
         if any(request.url.path.startswith(p) for p in self.PUBLIC_PATHS):
             return await call_next(request)
 
-        # Require Bearer token for /mcp endpoint
-        if request.url.path.startswith("/mcp"):
+        # Require Bearer token for MCP endpoint (root path, not matching any public path)
+        if request.url.path == "/":
             issuer_url = get_issuer_url(request)
             auth_header = request.headers.get("Authorization", "")
             if not auth_header.startswith("Bearer "):
@@ -133,7 +133,7 @@ class OAuthAuthMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
 
         # Add headers to disable proxy buffering for SSE/streaming (critical for nginx/Synology)
-        if request.url.path.startswith("/mcp"):
+        if request.url.path == "/":
             response.headers["X-Accel-Buffering"] = "no"
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
 
@@ -180,7 +180,7 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
     issuer_url = get_issuer_url(request)
     return JSONResponse(
         {
-            "resource": f"{issuer_url}/mcp",
+            "resource": issuer_url,
             "authorization_servers": [issuer_url],
             "scopes_supported": ["mcp:tools"],
             "bearer_methods_supported": ["header"],
@@ -741,7 +741,7 @@ async def get_memo(memo_uid: str) -> str:
 def create_app():
     """Create ASGI app with OAuth authentication and CORS middleware."""
     return mcp.http_app(
-        path="/mcp",
+        path="/",
         transport="streamable-http",
         middleware=[
             # CORS middleware MUST come first to handle preflight OPTIONS requests
