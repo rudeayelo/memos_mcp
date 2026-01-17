@@ -9,10 +9,16 @@ services:
       MEMOS_BASE_URL: ${MEMOS_BASE_URL}
       MEMOS_API_TOKEN: ${MEMOS_API_TOKEN}
       OAUTH_PASSWORD: ${OAUTH_PASSWORD}
+      OAUTH_TOKEN_STORAGE_PATH: /data/oauth_tokens.json
       MEMOS_MCP_PORT: "8716"
+    volumes:
+      - memos-mcp-data:/data
     healthcheck:
       test: ["CMD-SHELL", "nc -z 127.0.0.1 8716 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
       start_period: 30s
+
+volumes:
+  memos-mcp-data:
