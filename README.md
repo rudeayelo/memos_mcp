@@ -74,6 +74,7 @@ pip install -r requirements.txt
 | `OAUTH_PASSWORD` | Password for OAuth authorization | (required) |
 | `OAUTH_ISSUER_URL` | Public HTTPS URL of this server | `http://localhost:8716` |
 | `OAUTH_TOKEN_EXPIRY_SECONDS` | Access token lifetime | `3600` |
+| `OAUTH_TOKEN_STORAGE_PATH` | Path to persist tokens (survives restarts) | (none) |
 
 ### Getting a Memos API Token
 
@@ -88,6 +89,13 @@ pip install -r requirements.txt
 
 #### Docker (recommended for production)
 ```bash
+docker compose up -d
+```
+
+To customize paths (e.g., for Synology NAS), copy the override example and edit:
+```bash
+cp docker-compose.override.yml.example docker-compose.override.yml
+# Edit docker-compose.override.yml with your local paths
 docker compose up -d
 ```
 
@@ -200,7 +208,7 @@ When you connect Claude to this server:
 ### Security Notes
 
 - **HTTPS Required**: OAuth tokens must be transmitted over HTTPS
-- **In-Memory Tokens**: Tokens are stored in memory and lost on server restart (you'll need to re-authorize)
+- **Token Storage**: By default, tokens are stored in memory and lost on server restart. Set `OAUTH_TOKEN_STORAGE_PATH` to persist tokens to disk for permanent sessions
 - **Single User**: This implementation uses a single password for all access
 - **PKCE**: Full PKCE support for secure token exchange
 

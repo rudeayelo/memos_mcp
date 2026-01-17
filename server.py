@@ -10,9 +10,11 @@ Uses OAuth 2.0 Authorization Code flow with PKCE for authentication.
 
 import base64
 import hashlib
+import json
 import os
 import secrets
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -35,6 +37,7 @@ MEMOS_API_TOKEN = os.getenv("MEMOS_API_TOKEN", "")
 OAUTH_PASSWORD = os.getenv("OAUTH_PASSWORD", "")
 OAUTH_ISSUER_URL = os.getenv("OAUTH_ISSUER_URL", "")  # If empty, auto-detect from request
 OAUTH_TOKEN_EXPIRY_SECONDS = int(os.getenv("OAUTH_TOKEN_EXPIRY_SECONDS", "3600"))
+OAUTH_TOKEN_STORAGE_PATH = os.getenv("OAUTH_TOKEN_STORAGE_PATH", "")  # Path to persist tokens (optional)
 
 
 def get_issuer_url(request: Request) -> str:
@@ -49,11 +52,69 @@ def get_issuer_url(request: Request) -> str:
     host = request.headers.get("x-forwarded-host") or request.headers.get("host", request.url.netloc)
     return f"{proto}://{host}"
 
-# In-memory OAuth storage (resets on server restart)
+# In-memory OAuth storage (persisted to disk if OAUTH_TOKEN_STORAGE_PATH is set)
 registered_clients: dict = {}      # client_id -> client metadata
 authorization_codes: dict = {}     # code -> {client_id, redirect_uri, code_challenge, expires_at, scope}
 access_tokens: dict = {}           # token -> {client_id, expires_at, scope}
 refresh_tokens: dict = {}          # refresh_token -> {client_id, scope}
+
+
+def _load_tokens_from_disk():
+    """Load persisted tokens from disk if storage path is configured."""
+    global registered_clients, access_tokens, refresh_tokens
+    if not OAUTH_TOKEN_STORAGE_PATH:
+        return
+    storage_path = Path(OAUTH_TOKEN_STORAGE_PATH)
+    if not storage_path.exists():
+        return
+    try:
+        with open(storage_path) as f:
+            data = json.load(f)
+        # Convert expires_at strings back to datetime objects
+        for token, token_data in data.get("access_tokens", {}).items():
+            if "expires_at" in token_data:
+                token_data["expires_at"] = datetime.fromisoformat(token_data["expires_at"])
+        registered_clients.update(data.get("registered_clients", {}))
+        access_tokens.update(data.get("access_tokens", {}))
+        refresh_tokens.update(data.get("refresh_tokens", {}))
+        print(f"Loaded {len(access_tokens)} access tokens and {len(refresh_tokens)} refresh tokens from {storage_path}")
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"Warning: Failed to load tokens from {storage_path}: {e}")
+
+
+def _save_tokens_to_disk():
+    """Persist tokens to disk if storage path is configured."""
+    if not OAUTH_TOKEN_STORAGE_PATH:
+        return
+    storage_path = Path(OAUTH_TOKEN_STORAGE_PATH)
+    # Ensure parent directory exists
+    storage_path.parent.mkdir(parents=True, exist_ok=True)
+    # Convert datetime objects to ISO strings for JSON serialization
+    serializable_access_tokens = {}
+    for token, token_data in access_tokens.items():
+        serializable_access_tokens[token] = {
+            **token_data,
+            "expires_at": token_data["expires_at"].isoformat() if "expires_at" in token_data else None,
+        }
+    data = {
+        "registered_clients": registered_clients,
+        "access_tokens": serializable_access_tokens,
+        "refresh_tokens": refresh_tokens,
+    }
+    try:
+        with open(storage_path, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"Saved {len(access_tokens)} access tokens and {len(refresh_tokens)} refresh tokens to {storage_path}")
+    except OSError as e:
+        print(f"Warning: Failed to save tokens to {storage_path}: {e}")
+
+
+# Load tokens on startup
+if OAUTH_TOKEN_STORAGE_PATH:
+    print(f"Token persistence enabled: {OAUTH_TOKEN_STORAGE_PATH}")
+    _load_tokens_from_disk()
+else:
+    print("Token persistence disabled (OAUTH_TOKEN_STORAGE_PATH not set)")
 
 
 def get_headers() -> dict:
@@ -222,6 +283,8 @@ async def register_client(request: Request) -> JSONResponse:
         client_info["scope"] = body["scope"]
 
     registered_clients[client_id] = client_info
+    print(f"Registered new OAuth client: {client_id}")
+    _save_tokens_to_disk()
 
     return JSONResponse(
         client_info,
@@ -378,15 +441,18 @@ async def token_endpoint(request: Request) -> JSONResponse:
         access_token = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
 
+        expires_at = datetime.utcnow() + timedelta(seconds=OAUTH_TOKEN_EXPIRY_SECONDS)
         access_tokens[access_token] = {
             "client_id": client_id,
-            "expires_at": datetime.utcnow() + timedelta(seconds=OAUTH_TOKEN_EXPIRY_SECONDS),
+            "expires_at": expires_at,
             "scope": code_data["scope"],
         }
         refresh_tokens[refresh_token] = {
             "client_id": client_id,
             "scope": code_data["scope"],
         }
+        print(f"Created new access token for client {client_id} (expires: {expires_at.isoformat()})")
+        _save_tokens_to_disk()
 
         # Delete used authorization code
         del authorization_codes[code]
@@ -418,11 +484,14 @@ async def token_endpoint(request: Request) -> JSONResponse:
 
         # Generate new access token
         new_access_token = secrets.token_urlsafe(32)
+        expires_at = datetime.utcnow() + timedelta(seconds=OAUTH_TOKEN_EXPIRY_SECONDS)
         access_tokens[new_access_token] = {
             "client_id": client_id,
-            "expires_at": datetime.utcnow() + timedelta(seconds=OAUTH_TOKEN_EXPIRY_SECONDS),
+            "expires_at": expires_at,
             "scope": token_data["scope"],
         }
+        print(f"Refreshed access token for client {client_id} (expires: {expires_at.isoformat()})")
+        _save_tokens_to_disk()
 
         return JSONResponse(
             {
