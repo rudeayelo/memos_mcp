@@ -42,6 +42,9 @@ COPY server.py ./
 # Set ownership
 RUN chown -R mcp:mcp /app
 
+# Create data directory for optional token persistence
+RUN mkdir -p /data && chown mcp:mcp /data
+
 # Switch to non-root user
 USER mcp
 
